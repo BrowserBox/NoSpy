@@ -1,6 +1,9 @@
 // nospy.swift
-// CLI tool to toggle macOS microphone input volume (mute/unmute default input)
-// Checks for Siri/Assistant activity on mute → auto-opens settings pane if enabled
+// CLI tool to toggle macOS microphone input volume (mute/unmute default input).
+// On mute, warns if Siri / Apple Intelligence may still be listening.
+// Persists pre-mute volume to ~/Library/Application Support/nospy/state.json
+// so `off` restores what you had instead of jumping to a hardcoded value.
+//
 // Compile: swiftc nospy.swift -o nospy
 
 import Foundation
@@ -48,6 +51,47 @@ func explainOsascriptFailure(_ r: ProcResult) {
         print("   System Settings → Privacy & Security → Automation → (your terminal) → System Events.")
     } else if !r.stderr.isEmpty {
         print("osascript: \(r.stderr)")
+    }
+}
+
+// MARK: - State (pre-mute volume persistence)
+
+enum StateStore {
+    static var dirURL: URL {
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("nospy", isDirectory: true)
+    }
+    static var fileURL: URL { dirURL.appendingPathComponent("state.json") }
+
+    /// Saved pre-mute volume, or nil if missing/corrupt/out-of-range.
+    static func loadPreMuteVolume() -> Int? {
+        guard let data = try? Data(contentsOf: fileURL),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let v = obj["preMuteVolume"] as? Int,
+              (0...100).contains(v)
+        else { return nil }
+        return v
+    }
+
+    /// Best-effort write; failures are swallowed so we never refuse to mute.
+    static func savePreMuteVolume(_ v: Int) {
+        do {
+            try FileManager.default.createDirectory(
+                at: dirURL,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            let obj: [String: Any] = ["preMuteVolume": v]
+            let data = try JSONSerialization.data(withJSONObject: obj,
+                                                  options: [.prettyPrinted])
+            try data.write(to: fileURL, options: [.atomic])
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                   ofItemAtPath: fileURL.path)
+        } catch {
+            // intentional: state persistence is non-critical
+        }
     }
 }
 
@@ -147,7 +191,7 @@ func setInputVolume(_ target: Int) -> Bool {
     return r.ok
 }
 
-// MARK: - Siri / Assistant
+// MARK: - Siri / Apple Intelligence (basic — broadened in Step 2)
 
 func isAssistantEnabled() -> Bool {
     let r = runProcess("/usr/bin/defaults",
@@ -173,8 +217,8 @@ if arg == "--help" || arg == "-h" {
     print("nospy - quick mic mute toggle with Siri privacy check")
     print("Usage: nospy [toggle|on|off|status|siri]")
     print("  (no arg) = toggle mute/unmute")
-    print("  on       = force mute")
-    print("  off      = force unmute (to 80)")
+    print("  on       = force mute (saves current level first)")
+    print("  off      = force unmute (restores saved level, or 80)")
     print("  status   = show current state + Siri note if relevant")
     print("  siri     = open System Settings → Siri pane")
     exit(0)
@@ -194,30 +238,50 @@ guard let current = getInputVolume() else {
     exit(1)
 }
 
-let target: Int
-switch arg {
-case "on", "mute":
-    target = 0
-case "off", "unmute":
-    target = 80
-case "status":
-    let emoji = current == 0 ? "🔴 Muted" : "🟢 Live"
-    print("\(emoji) (input volume: \(current))")
+let isMuted = current == 0
 
-    if current == 0 && isAssistantEnabled() {
+if arg == "status" {
+    let emoji = isMuted ? "🔴 Muted" : "🟢 Live"
+    var line = "\(emoji) (input volume: \(current))"
+    if isMuted, let saved = StateStore.loadPreMuteVolume() {
+        line += " — pre-mute saved: \(saved)"
+    }
+    print(line)
+    if isMuted && isAssistantEnabled() {
         print("⚠️ Note: System input is muted, but if 'Listen for “Siri”' is on, background wake-word may still work.")
         print("   Run 'nospy siri' to open the Siri settings pane and disable it easily.")
-        print("   Or go to System Settings > Apple Intelligence & Siri (or Siri & Spotlight).")
     }
     exit(0)
-default:  // toggle
-    target = current == 0 ? 80 : 0
+}
+
+enum Action { case mute, unmute }
+let action: Action
+switch arg {
+case "on", "mute":      action = .mute
+case "off", "unmute":   action = .unmute
+default:                action = isMuted ? .unmute : .mute    // toggle
+}
+
+let target: Int
+switch action {
+case .mute:
+    if isMuted {
+        print("🔴 Already muted (input volume: 0)")
+        exit(0)
+    }
+    StateStore.savePreMuteVolume(current)
+    target = 0
+case .unmute:
+    if !isMuted {
+        print("🟢 Already unmuted (input volume: \(current))")
+        exit(0)
+    }
+    target = StateStore.loadPreMuteVolume() ?? 80
 }
 
 if setInputVolume(target) {
     let emoji = target == 0 ? "🔴 Muted" : "🟢 Unmuted"
     print("\(emoji) (set to \(target))")
-
     if target == 0 && isAssistantEnabled() {
         print("⚠️ Heads up: 'Hey Siri' / 'Listen for Siri' may still detect sound even when muted.")
         print("   Auto-opening System Settings → Siri pane for easy disable...")
