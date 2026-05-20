@@ -173,6 +173,96 @@ func halSetInputVolume(_ target: Int) -> Bool {
     return anyOK
 }
 
+// MARK: - Listening (is the mic actually in use?)
+// "Is something listening RIGHT NOW?" — the question the orange dot in Control
+// Center answers. We read kAudioDevicePropertyDeviceIsRunningSomewhere on the
+// default input. Process attribution (which app holds the mic) uses the
+// kAudioHardwarePropertyProcessObjectList family added in macOS 14; on older
+// systems we report active/idle without names. No private APIs.
+
+struct MicActivity {
+    let active: Bool
+    /// Bundle IDs (preferred) or "PID 1234" labels of processes using the mic.
+    let consumers: [String]
+    /// True if process-list enumeration ran (macOS 14+); false on older OSes.
+    let attributionAvailable: Bool
+}
+
+private func defaultInputIsActive() -> Bool? {
+    guard let device = defaultInputDeviceID() else { return nil }
+    var running: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    let s = AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &running)
+    return s == noErr ? (running != 0) : nil
+}
+
+@available(macOS 14.0, *)
+private func micConsumerLabels() -> [String] {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var dataSize: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),
+                                         &addr, 0, nil, &dataSize) == noErr,
+          dataSize > 0 else { return [] }
+    let count = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+    var processObjects = [AudioObjectID](repeating: 0, count: count)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &dataSize, &processObjects) == noErr
+    else { return [] }
+
+    var labels: [String] = []
+    for obj in processObjects {
+        var inputRunning: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var inAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyIsRunningInput,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(obj, &inAddr, 0, nil, &size, &inputRunning) == noErr,
+              inputRunning != 0 else { continue }
+
+        // Prefer bundle ID; fall back to PID.
+        var bundleRef: Unmanaged<CFString>?
+        var bSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var bAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyBundleID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectGetPropertyData(obj, &bAddr, 0, nil, &bSize, &bundleRef) == noErr,
+           let unmanaged = bundleRef {
+            let s = unmanaged.takeRetainedValue() as String
+            if !s.isEmpty { labels.append(s); continue }
+        }
+
+        var pid: pid_t = 0
+        var pSize = UInt32(MemoryLayout<pid_t>.size)
+        var pAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyPID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectGetPropertyData(obj, &pAddr, 0, nil, &pSize, &pid) == noErr {
+            labels.append("PID \(pid)")
+        }
+    }
+    return labels
+}
+
+func micActivity() -> MicActivity {
+    let active = defaultInputIsActive() ?? false
+    if #available(macOS 14.0, *) {
+        return MicActivity(active: active,
+                           consumers: micConsumerLabels(),
+                           attributionAvailable: true)
+    }
+    return MicActivity(active: active, consumers: [], attributionAvailable: false)
+}
+
 // MARK: - Volume (HAL primary, AppleScript fallback)
 
 func getInputVolume() -> Int? {
@@ -287,12 +377,13 @@ let arg = args.count > 1 ? args[1].lowercased() : "toggle"
 
 if arg == "--help" || arg == "-h" {
     print("nospy - quick mic mute toggle with Siri privacy check")
-    print("Usage: nospy [toggle|on|off|status|siri]")
-    print("  (no arg) = toggle mute/unmute")
-    print("  on       = force mute (saves current level first)")
-    print("  off      = force unmute (restores saved level, or 80)")
-    print("  status   = show current state + Siri note if relevant")
-    print("  siri     = open System Settings → Siri pane")
+    print("Usage: nospy [toggle|on|off|status|siri|listening]")
+    print("  (no arg)  = toggle mute/unmute")
+    print("  on        = force mute (saves current level first)")
+    print("  off       = force unmute (restores saved level, or 80)")
+    print("  status    = show mute + Siri breakdown + mic activity")
+    print("  siri      = open System Settings → Siri pane")
+    print("  listening = show which apps (if any) are currently using the mic")
     exit(0)
 }
 
@@ -301,6 +392,25 @@ if arg == "siri" {
         print("Opened System Settings → Siri pane. Turn off 'Listen for “Siri”' or 'Hey Siri' for full mic privacy.")
     } else {
         print("Failed to open Siri settings. Go manually: System Settings > Apple Intelligence & Siri (or Siri & Spotlight).")
+    }
+    exit(0)
+}
+
+if arg == "listening" {
+    let m = micActivity()
+    if m.active {
+        var line = "🔴 Mic ACTIVE"
+        if !m.consumers.isEmpty {
+            line += " — " + m.consumers.joined(separator: ", ")
+        } else if m.attributionAvailable {
+            line += " (no process attribution available)"
+        }
+        print(line)
+    } else {
+        print("🟢 Mic idle")
+    }
+    if !m.attributionAvailable {
+        print("   (process attribution requires macOS 14+; only active/idle reported)")
     }
     exit(0)
 }
@@ -319,6 +429,13 @@ if arg == "status" {
         line += " — pre-mute saved: \(saved)"
     }
     print(line)
+
+    let m = micActivity()
+    var micLine = "Mic: " + (m.active ? "🔴 ACTIVE" : "🟢 idle")
+    if m.active && !m.consumers.isEmpty {
+        micLine += " — " + m.consumers.joined(separator: ", ")
+    }
+    print(micLine)
 
     let siri = readSiriStatus()
     print("Siri / Apple Intelligence:")
