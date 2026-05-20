@@ -191,14 +191,86 @@ func setInputVolume(_ target: Int) -> Bool {
     return r.ok
 }
 
-// MARK: - Siri / Apple Intelligence (basic — broadened in Step 2)
+// MARK: - Siri / Apple Intelligence detection
+// "Is something listening?" isn't a single bit on modern macOS. Siri, "Hey Siri"
+// wake word, Dictation, and Apple Intelligence each have their own master
+// switches across several preference domains, and the exact set of keys/domains
+// changes between macOS versions. We probe a defensive superset: any signal we
+// recognize as ON counts; missing keys/domains are treated as OFF (not errors).
+//
+// We use CFPreferencesCopyAppValue (in-process) instead of shelling out to
+// `defaults` so a status check is one fast call, not 10+ subprocesses.
 
-func isAssistantEnabled() -> Bool {
-    let r = runProcess("/usr/bin/defaults",
-                       ["read", "com.apple.assistant.support", "Assistant Enabled"])
-    guard r.ok else { return false }
-    let s = r.stdout.lowercased()
-    return s == "1" || s == "true"
+private func readDefaultsBool(_ domain: String, _ key: String) -> Bool {
+    guard let v = CFPreferencesCopyAppValue(key as CFString, domain as CFString) else {
+        return false
+    }
+    if CFGetTypeID(v) == CFBooleanGetTypeID() {
+        return CFBooleanGetValue((v as! CFBoolean))
+    }
+    if let n = v as? NSNumber { return n.intValue != 0 }
+    if let s = v as? String { return s == "1" || s.lowercased() == "true" }
+    return false
+}
+
+struct SiriSignal {
+    let label: String
+    /// One or more (domain, key) probes; the signal is ON if any probe is ON.
+    let sources: [(domain: String, key: String)]
+    let on: Bool
+}
+
+struct SiriStatus {
+    let signals: [SiriSignal]
+    var anyOn: Bool { signals.contains { $0.on } }
+
+    /// Inline one-line summary, e.g. "Siri assistant, Dictation ON".
+    var compactSummary: String {
+        let onLabels = signals.filter { $0.on }.map { $0.label }
+        if onLabels.isEmpty { return "no Siri / Apple Intelligence signals on" }
+        return onLabels.joined(separator: ", ") + " ON"
+    }
+
+    /// Per-signal breakdown lines, for `status` output.
+    var detailedLines: [String] {
+        signals.map { sig in
+            "   \(sig.on ? "🟠 ON " : "⚪ off") \(sig.label)"
+        }
+    }
+}
+
+func readSiriStatus() -> SiriStatus {
+    let defs: [(String, [(String, String)])] = [
+        ("Siri assistant", [
+            ("com.apple.assistant.support",  "Assistant Enabled"),
+            ("com.apple.assistant.backedup", "Use Assistant"),
+        ]),
+        ("\"Hey Siri\" wake word", [
+            ("com.apple.Siri",               "VoiceTriggerUserEnabled"),
+            ("com.apple.assistant.support",  "Voice Trigger Enabled"),
+        ]),
+        ("Siri in menu bar", [
+            ("com.apple.Siri",               "StatusMenuVisible"),
+        ]),
+        ("Dictation", [
+            ("com.apple.assistant.support",  "Dictation Enabled"),
+            ("com.apple.speech.recognition.AppleSpeechRecognition.prefs",
+                                             "DictationIMMasterDictationEnabled"),
+            ("com.apple.HIToolbox",          "AppleDictationAutoEnable"),
+        ]),
+        ("Apple Intelligence", [
+            ("com.apple.intelligenceflags",     "Apple Intelligence Enabled"),
+            ("com.apple.intelligenceflags",     "Enabled"),
+            ("com.apple.intelligence",          "Enabled"),
+            ("com.apple.intelligenceplatform",  "Enabled"),
+        ]),
+    ]
+    let signals = defs.map { (label, sources) -> SiriSignal in
+        let tuples = sources.map { (domain: $0.0, key: $0.1) }
+        let on = tuples.contains { readDefaultsBool($0.domain, $0.key) }
+        return SiriSignal(label: label, sources: tuples, on: on)
+    }
+    return SiriStatus(signals: signals)
 }
 
 // MARK: - Settings deep links
@@ -247,9 +319,13 @@ if arg == "status" {
         line += " — pre-mute saved: \(saved)"
     }
     print(line)
-    if isMuted && isAssistantEnabled() {
-        print("⚠️ Note: System input is muted, but if 'Listen for “Siri”' is on, background wake-word may still work.")
-        print("   Run 'nospy siri' to open the Siri settings pane and disable it easily.")
+
+    let siri = readSiriStatus()
+    print("Siri / Apple Intelligence:")
+    for l in siri.detailedLines { print(l) }
+    if isMuted && siri.anyOn {
+        print("⚠️ Input is muted, but the signals above can still process audio.")
+        print("   Run 'nospy siri' to open the Siri settings pane.")
     }
     exit(0)
 }
@@ -282,11 +358,14 @@ case .unmute:
 if setInputVolume(target) {
     let emoji = target == 0 ? "🔴 Muted" : "🟢 Unmuted"
     print("\(emoji) (set to \(target))")
-    if target == 0 && isAssistantEnabled() {
-        print("⚠️ Heads up: 'Hey Siri' / 'Listen for Siri' may still detect sound even when muted.")
-        print("   Auto-opening System Settings → Siri pane for easy disable...")
-        if !openSiriSettings() {
-            print("   Failed to auto-open. Run 'nospy siri' or go manually: System Settings > Apple Intelligence & Siri.")
+    if target == 0 {
+        let siri = readSiriStatus()
+        if siri.anyOn {
+            print("⚠️ Mic input is 0, but these listening signals are still ON: \(siri.compactSummary)")
+            print("   Auto-opening System Settings → Siri pane for easy disable...")
+            if !openSiriSettings() {
+                print("   Failed to auto-open. Run 'nospy siri' or go manually: System Settings > Apple Intelligence & Siri.")
+            }
         }
     }
 } else {
