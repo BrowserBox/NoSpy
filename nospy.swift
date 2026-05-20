@@ -4,90 +4,167 @@
 // Compile: swiftc nospy.swift -o nospy
 
 import Foundation
+import CoreAudio
 
-// MARK: - Helpers
+// MARK: - Process helpers
 
-func runAppleScript(_ script: String) -> Bool {
+struct ProcResult {
+    let status: Int32
+    let stdout: String
+    let stderr: String
+    var ok: Bool { status == 0 }
+}
+
+func runProcess(_ executable: String, _ args: [String]) -> ProcResult {
     let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    task.arguments = ["-e", script]
-    
+    task.executableURL = URL(fileURLWithPath: executable)
+    task.arguments = args
+    let outPipe = Pipe(), errPipe = Pipe()
+    task.standardOutput = outPipe
+    task.standardError = errPipe
     do {
         try task.run()
         task.waitUntilExit()
-        return task.terminationStatus == 0
     } catch {
-        print("Error running osascript: \(error)")
-        return false
+        return ProcResult(status: -1, stdout: "", stderr: "\(error)")
+    }
+    let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(),
+                     encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(),
+                     encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return ProcResult(status: task.terminationStatus, stdout: out, stderr: err)
+}
+
+func runAppleScript(_ script: String) -> ProcResult {
+    runProcess("/usr/bin/osascript", ["-e", script])
+}
+
+func explainOsascriptFailure(_ r: ProcResult) {
+    let s = r.stderr.lowercased()
+    if s.contains("not authorized") || s.contains("not allowed") || s.contains("-1743") {
+        print("⚠️ osascript was denied. Grant your terminal Automation access:")
+        print("   System Settings → Privacy & Security → Automation → (your terminal) → System Events.")
+    } else if !r.stderr.isEmpty {
+        print("osascript: \(r.stderr)")
     }
 }
 
-func getInputVolume() -> Int? {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    task.arguments = ["-e", "input volume of (get volume settings)"]
-    
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    
-    do {
-        try task.run()
-        task.waitUntilExit()
-        
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        if let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let vol = Int(str) {
-            return vol
-        }
-    } catch {
-        print("Error getting volume: \(error)")
+// MARK: - CoreAudio HAL (input volume)
+// Many input devices (USB displays, Bluetooth headsets) don't expose a software
+// input volume to AppleScript — `get volume settings` returns "missing value".
+// HAL works across that broader set of devices; it's the primary path. AppleScript
+// is kept as a fallback for the rare device where HAL has no volume property.
+
+private func defaultInputDeviceID() -> AudioDeviceID? {
+    var id = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    let s = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                       &addr, 0, nil, &size, &id)
+    return (s == noErr && id != 0) ? id : nil
+}
+
+/// Elements (channels) on the input scope that expose VolumeScalar.
+/// Tries master (element 0); falls back to per-channel for devices without master.
+private func inputVolumeElements(of device: AudioDeviceID) -> [UInt32] {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyVolumeScalar,
+        mScope: kAudioDevicePropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain)
+    if AudioObjectHasProperty(device, &addr) {
+        return [kAudioObjectPropertyElementMain]
     }
+    var elems: [UInt32] = []
+    for ch: UInt32 in 1...16 {
+        addr.mElement = ch
+        if AudioObjectHasProperty(device, &addr) { elems.append(ch) }
+    }
+    return elems
+}
+
+func halGetInputVolume() -> Int? {
+    guard let device = defaultInputDeviceID() else { return nil }
+    let elems = inputVolumeElements(of: device)
+    guard !elems.isEmpty else { return nil }
+    var sum: Float32 = 0
+    var count: Float32 = 0
+    for el in elems {
+        var v: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: el)
+        if AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &v) == noErr {
+            sum += v
+            count += 1
+        }
+    }
+    guard count > 0 else { return nil }
+    return Int((sum / count * 100).rounded())
+}
+
+func halSetInputVolume(_ target: Int) -> Bool {
+    guard let device = defaultInputDeviceID() else { return false }
+    let elems = inputVolumeElements(of: device)
+    guard !elems.isEmpty else { return false }
+    let scalar = max(0 as Float32, min(1, Float32(target) / 100.0))
+    var anyOK = false
+    for el in elems {
+        var v = scalar
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: el)
+        if AudioObjectSetPropertyData(device, &addr, 0, nil,
+                                      UInt32(MemoryLayout<Float32>.size), &v) == noErr {
+            anyOK = true
+        }
+    }
+    return anyOK
+}
+
+// MARK: - Volume (HAL primary, AppleScript fallback)
+
+func getInputVolume() -> Int? {
+    if let v = halGetInputVolume() { return v }
+    let r = runAppleScript("input volume of (get volume settings)")
+    if r.ok, let v = Int(r.stdout), (0...100).contains(v) { return v }
+    if !r.ok { explainOsascriptFailure(r) }
     return nil
 }
 
 func setInputVolume(_ target: Int) -> Bool {
-    runAppleScript("set volume input volume \(target)")
+    let clamped = max(0, min(100, target))
+    if halSetInputVolume(clamped) { return true }
+    let r = runAppleScript("set volume input volume \(clamped)")
+    if !r.ok { explainOsascriptFailure(r) }
+    return r.ok
 }
+
+// MARK: - Siri / Assistant
 
 func isAssistantEnabled() -> Bool {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
-    task.arguments = ["read", "com.apple.assistant.support", "Assistant Enabled"]
-    
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    
-    do {
-        try task.run()
-        task.waitUntilExit()
-        
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        if let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
-            // "1" or "true" means enabled
-            return str == "1" || str.lowercased() == "true"
-        }
-    } catch {
-        // If key missing or error, assume not enabled
-    }
-    return false
+    let r = runProcess("/usr/bin/defaults",
+                       ["read", "com.apple.assistant.support", "Assistant Enabled"])
+    guard r.ok else { return false }
+    let s = r.stdout.lowercased()
+    return s == "1" || s == "true"
 }
+
+// MARK: - Settings deep links
 
 func openSiriSettings() -> Bool {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    task.arguments = ["x-apple.systempreferences:com.apple.Siri-Settings.extension"]
-    
-    do {
-        try task.run()
-        task.waitUntilExit()
-        return task.terminationStatus == 0
-    } catch {
-        print("Error opening Siri settings: \(error)")
-        return false
-    }
+    runProcess("/usr/bin/open",
+               ["x-apple.systempreferences:com.apple.Siri-Settings.extension"]).ok
 }
 
-// MARK: - Main logic
+// MARK: - CLI dispatch
 
 let args = CommandLine.arguments
 let arg = args.count > 1 ? args[1].lowercased() : "toggle"
@@ -126,7 +203,7 @@ case "off", "unmute":
 case "status":
     let emoji = current == 0 ? "🔴 Muted" : "🟢 Live"
     print("\(emoji) (input volume: \(current))")
-    
+
     if current == 0 && isAssistantEnabled() {
         print("⚠️ Note: System input is muted, but if 'Listen for “Siri”' is on, background wake-word may still work.")
         print("   Run 'nospy siri' to open the Siri settings pane and disable it easily.")
@@ -137,13 +214,10 @@ default:  // toggle
     target = current == 0 ? 80 : 0
 }
 
-let success = setInputVolume(target)
-
-if success {
+if setInputVolume(target) {
     let emoji = target == 0 ? "🔴 Muted" : "🟢 Unmuted"
     print("\(emoji) (set to \(target))")
-    
-    // After muting, check Siri → auto-open if enabled
+
     if target == 0 && isAssistantEnabled() {
         print("⚠️ Heads up: 'Hey Siri' / 'Listen for Siri' may still detect sound even when muted.")
         print("   Auto-opening System Settings → Siri pane for easy disable...")
@@ -153,4 +227,5 @@ if success {
     }
 } else {
     print("Failed to set input volume")
+    exit(1)
 }
