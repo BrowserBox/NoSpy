@@ -9,10 +9,12 @@ let package = Package(
     name: "NoSpy",
     platforms: [.macOS(.v12)],
     products: [
-        .executable(name: "nospy", targets: ["nospy"]),
+        .executable(name: "nospy",    targets: ["nospy"]),
+        .executable(name: "NoSpyBar", targets: ["NoSpyBar"]),
     ],
     targets: [
         .target(name: "NoSpyCore"),
-        .executableTarget(name: "nospy", dependencies: ["NoSpyCore"]),
+        .executableTarget(name: "nospy",    dependencies: ["NoSpyCore"]),
+        .executableTarget(name: "NoSpyBar", dependencies: ["NoSpyCore"]),
     ]
 )
